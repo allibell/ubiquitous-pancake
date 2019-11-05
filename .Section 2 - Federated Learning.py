@@ -475,8 +475,10 @@ transform = transforms.Compose([transforms.ToTensor()])
 mnist_trainset = torch_datasets.MNIST(root='./data', train=True, download=True, transform=transform)
 mnist_testset = torch_datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
-trainloader = torch.utils.data.DataLoader(mnist_trainset, batch_size=64, shuffle=True)
-testloader = torch.utils.data.DataLoader(mnist_testset, batch_size=64, shuffle=True)
+train_data = mnist_trainset.data
+train_targets = mnist_trainset.targets
+test_data = mnist_testset.data
+test_targets = mnist_testset.targets
 
 # +
 import syft as sy
@@ -505,46 +507,168 @@ class MNISTClassifier(nn.Module):
         x = self.dropout(F.relu(self.fc1(x)))
         x = self.dropout(F.relu(self.fc2(x)))
         x = self.dropout(F.relu(self.fc3(x)))
-        x = F.log_sfotmax(self.fc4(x), dim-1)
+        x = F.log_softmax(self.fc4(x), dim=1)
 
         return x
 
-model = MNISTClassifier()
-criterion = nn.NLLLoss()
-otpimizer = optim.Adam(model.parameters(), lr=0.003)
+# +
+def create_workers(num_workers):
+    return [sy.VirtualWorker(hook, id=f"worker_{i}") for i in range(num_workers)]
+
+def send_data_to_workers(workers, trainset, testset):
+    train_data_per_worker = len(trainset) // len(workers)
+    test_data_per_worker = len(testset) // len(workers)
+
+    _trainset, _testset = [], []
+    for i, worker in enumerate(workers):
+        tn_lo = i * train_data_per_worker
+        tn_hi = tn_lo + train_data_per_worker
+        tn_data, tn_targets = (data[tn_lo:tn_hi].send(worker) for data in (trainset.data, trainset.targets))
+        _trainset.append((tn_data, tn_targets))
+
+        te_lo = i * test_data_per_worker
+        te_hi = te_lo + test_data_per_worker
+        te_data, te_targets = (data[te_lo:te_hi].send(worker) for data in (testset.data, testset.targets))
+        _testset.append((te_data, te_targets))
+
+    return _trainset, _testset
 
 
 # -
 
-def create_workers(trainloader, testloader, num_workers):
-    workers = [sy.VirtualWorker(hook, id=f"worker_{i}") for i in range(num_workers)]
+# First implementation - as similar to normal PyTorch as possible, 
+# do training and testing on same set of remote workers
+def train_federated(trainset, testset, num_workers=24, epochs=30):
+    workers = create_workers(num_workers)
+    _trainset, _testset = send_data_to_workers(workers, trainset, testset)
 
-    train_batches_per_worker = len(trainloader) // len(workers)
-    worker_train_idxs = range(0, len(trainloader), train_batches_per_worker)
-    worker_train_idxs[-1] += len(trainloader) % len(workers)
-    worker_train_data = [
-                            trainloader[idx:idx+1].send(worker)
-                            for idx, worker in zip(worker_train_idxs, workers)
-                        ]
+    model = MNISTClassifier()
 
-    test_batches_per_worker = len(testloader) // len(workers)
-    worker_test_idxs = range(0, len(testloader), test_batches_per_worker)
-    worker_test_idxs[-1] += len(testloader) % len(workers)
-    worker_test_data = [
-                            testloader[idx:idx+1].send(worker)
-                            for idx, worker in zip(worker_test_idxs, workers)
-                       ]
-
-    datasets = list(zip(worker_train_data, worker_test_data))
-
-    return workers, datasets
-
-def train_federated(trainloader, testloader, num_workers=24, epochs=30):
     train_losses, test_losses = [], []
 
-    workers, datasets = create_workers(trainloader, testloader, num_workers)
+    for e in range(epochs):
+        running_loss = 0
+        
+        for _images, _labels in _trainset:
+
+            model = model.send(_images.location)
+            criterion = nn.NLLLoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.003)
+            optimizer.zero_grad()
+
+            log_ps = model(_images.float())
+            loss = criterion(log_ps, _labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.get().item()
+            model = model.get()
+
+        else:
+
+            test_loss = 0
+            accuracy = 0
+            model.eval()
+            for _images, _labels in _testset:
+                model = model.send(_images.location)
+                criterion = nn.NLLLoss()
+                log_ps = model(_images.float())
+                test_loss += criterion(log_ps, _labels).get().item()
+
+                _, top_class = torch.exp(log_ps).topk(1, dim=1)
+                equals = top_class == _labels.view(*top_class.shape)
+                accuracy += torch.mean(equals.float()).get().item()
+                model = model.get()
+
+            model.train()
+            train_losses.append(running_loss / len(trainset))
+            test_losses.append(test_loss / len(testset))
+
+            print("Epoch: {}/{} | ".format(e+1, epochs),
+                  "Training Loss: {:.3f} | ".format(running_loss/len(_trainset)),
+                  "Test Loss: {:.3f} | ".format(test_loss/len(_testset)),
+                  "Test Accuracy: {:.3f}".format(accuracy/len(_testset)))
 
 
-datasets
+train_federated(mnist_trainset, mnist_testset)
+
+
+
+# +
+# Second implementation - aggregating with a remote secure_tensor
+# train in parallel
+
+def send_train_data_to_workers(workers, trainset, batch_size):
+    data_per_worker = len(trainset) // len(workers)
+    
+    worker_data = []
+    for i, worker in enumerate(workers):
+        lo = i * data_per_worker
+        hi = lo + data_per_worker
+        
+        data, targets = (d[lo:hi].send(worker) for d in (trainset.data, trainset.targets))
+        batched_data = torch.split(data, batch_size)
+        batched_targets = torch.split(targets, batch_size)
+        worker_data.append(list(zip(batched_data, batched_targets)))
+    
+    return worker_data
+
+
+# -
+
+
+def train_federated(trainset, num_workers=10, epochs=5, batch_size=64):
+    manager = sy.VirtualWorker(hook, id="manager")
+    workers = create_workers(num_workers)
+    worker_data = send_train_data_to_workers(workers, trainset, batch_size)
+    
+    model = MNISTClassifier()
+    criterion = nn.NLLLoss()
+        
+    for e in range(epochs):
+        models  = [model.copy().send(worker) for worker in workers]
+        optimizers = [optim.Adam(model.parameters(), lr=0.003) for model in models]
+        
+        mean_loss = 0
+        
+        for i, worker in enumerate(worker_data):
+            model = models[i]
+            optimizer = optimizers[i]
+            
+            # batches
+            for images, labels in worker:
+                optimizer.zero_grad()
+
+                log_ps = model(images.float())
+                loss = criterion(log_ps, labels)
+                loss.backward()
+                optimizer.step()
+                
+                mean_loss += (loss.get().item() / len(worker_data))
+                
+        for model in models:
+            model.move(manager)
+
+        with torch.no_grad():
+            fc_layers = ("fc1", "fc2", "fc3", "fc4")
+            
+            for layer in fc_layers:
+                weights = torch.stack([getattr(m, layer).weight for m in models])
+                biases = torch.stack([getattr(m, layer).bias for m in models])
+
+                mean_weight = torch.mean(weights).get()
+                mean_bias = torch.mean(biases).get()
+                
+                model_layer = getattr(model, layer)
+                model_layer.weight.set_(mean_weight)
+                model_layer.bias.set_(mean_bias)
+                
+        model = model.get()
+
+        print("Epoch: {:0>2d}/{:0>2d} | ".format(e+1, epochs),
+              "Mean training Loss: {:.3f} ".format(mean_loss))
+
+
+train_federated(mnist_trainset)
 
 
